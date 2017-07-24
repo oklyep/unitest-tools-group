@@ -1,12 +1,9 @@
-import datetime
+import asyncio
 import logging
+from typing import Dict, Tuple, List
 
 from docker import Client
-from requests.exceptions import ReadTimeout
-from tornado import gen
 from tornado.httpclient import HTTPError
-from tornado.ioloop import IOLoop
-from tornado.queues import Queue
 
 from stand import Stand
 
@@ -24,18 +21,16 @@ class Engine(object):
         self.filter = {"ancestor": image}
         self._stands = {}
         self.queues = {}
-        self.stands()
+        asyncio.get_event_loop().create_task(self.stands())
 
-    def queues_status(self):
-        return {name: [v[2] for v in list(q._queue)] for name, q in self.queues.items()}
-
-    @gen.coroutine
-    def _queue_worker(self, queue):
+    async def _queue_worker(self, queue):
+        log.debug('start new queue worker')
         while True:
-            runnable, lock, name = yield queue.get()
+            func, lock, name = await queue.get()
+            log.debug('start task %s', name)
             try:
-                with (yield lock.acquire()):
-                    yield runnable()
+                with (await lock):
+                    await func()
             except Exception as e:
                 # 400 - ошибки связанные с инфраструктурой и ошибки после обновления тестовых сборок,
                 # т. е. штатные ситуации
@@ -47,8 +42,10 @@ class Engine(object):
             finally:
                 queue.task_done()
 
-    @gen.coroutine
-    def stands(self):
+    def queues_status(self):
+        return {name: [v[2] for v in list(q._queue)] for name, q in self.queues.items()}
+
+    async def stands(self):
         """
         Создает список контейнеров, открытых из указанных images на этом докер-хосте.
         Узнает у контейнеров имя базы с которой они работают
@@ -60,146 +57,134 @@ class Engine(object):
         # не будут показаны пользователю. quiet_exceptions - не логировать это исключение.
         # Им закончится выполнение футуры когда докер "очнется"
         try:
-            ps_result = yield gen.with_timeout(datetime.timedelta(seconds=5),
-                                               Stand.TPE.submit(self.docker.containers, all=True, filters=self.filter),
-                                               quiet_exceptions=(ReadTimeout))
-        except gen.TimeoutError:
+            ps_result = await asyncio.wait_for(
+                Stand.run_in_tpe(self.docker.containers, all=True, filters=self.filter), 5)
+        except asyncio.TimeoutError:
             log.debug('Cannot update stand list. Timeout in docker request')
             return self._stands
 
         # отсекаю слеш в начале имени
-        name_list = [record['Names'][0][1:] for record in ps_result]
+        name_list = {record['Names'][0][1:] for record in ps_result}
 
         # удаляю информацию о контейнерах которые перестали существовать
-        for current_name in list(self._stands):
-            if current_name not in name_list:
-                del self._stands[current_name]
+        for name in self._stands.keys() - name_list:
+            del self._stands[name]
 
-        for name in name_list:
-            if name in self._stands:
-                continue
-
+        # добавляю новые
+        for name in name_list - self._stands.keys():
             s = Stand(name=name,
                       test_tools_addr=self.domain_name,
                       stop_timeout=self.stop_timeout)
+
+            # Перед тем как передать управление отметим что с этим именем уже работаем
             self._stands[name] = s
-            with (yield s.lock.acquire()):
+
+            with (await s.lock):
                 # Если стенд не запущен, то нужно его запустить чтобы опросить на тему, какой сервер баз он использует
-                yield s.refresh()
+                await s.refresh()
                 if not s.running:
-                    yield s.start()
-                    yield s.stop()
+                    await s.start()
 
                 try:
                     # если уже есть очередь для этого сервера баз данных, то "записываем" стенд в эту очередь
                     s.queue = self.queues[s.db_addr]
                 except KeyError:
                     # если очереди нет, создаем новую
-                    q = Queue(maxsize=100)
+                    q = asyncio.Queue(maxsize=100)
                     s.queue = q
-                    IOLoop.current().spawn_callback(self._queue_worker, q)
+                    asyncio.get_event_loop().create_task(self._queue_worker(q))
                     self.queues[s.db_addr] = q
 
         return self._stands
 
-    @gen.coroutine
-    def refresh_all(self):
-        ss = yield self.stands()
-        yield gen.multi([s.refresh() for s in ss.values()])
+    async def refresh_all(self):
+        ss = await self.stands()
+        futures = [s.refresh() for s in ss.values()]
+        if futures:  # иначе ValueError: Set of coroutines/Futures is empty если нет стендов.
+            await asyncio.wait(futures)
         return ss
 
-    @gen.coroutine
-    def _free_resources(self):
+    async def _free_resources(self):
         """
         Можно ли запустить еще один стенд
         """
         c = 0
-        ss = yield self.refresh_all()
+        ss = await self.refresh_all()
         for s in ss.values():
             if s.running and s.tomcat_returncode is None:
                 c += 1
         if c >= self.max_active_stands:
             raise RuntimeError('No resources')
 
-    @gen.coroutine
-    def _stand_with_validate(self, name):
+    async def _stand_with_validate(self, name):
         try:
-            stands = yield self.stands()
+            stands = await self.stands()
             s = stands[name]
             assert isinstance(s, Stand)
             return s
         except KeyError:
             raise RuntimeError('Stand is not exists')
 
-    @gen.coroutine
-    def log(self, name, tail):
+    async def log(self, name, tail):
         """
         Получить логи стенда
         :param tail: колличество строк с конца
         """
 
-        s = yield self._stand_with_validate(name)
-        log_str = yield s.log(tail)
+        s = await self._stand_with_validate(name)
+        log_str = await s.log(tail)
         return log_str
 
-    @gen.coroutine
-    def stop(self, name):
+    async def stop(self, name):
         """
 ё       Остановить стенд
         """
-        s = yield self._stand_with_validate(name)
-        with (yield s.lock.acquire()):
-            yield s.stop()
+        s = await self._stand_with_validate(name)
+        with (await s.lock):
+            await s.stop()
         return 'Done'
 
-    @gen.coroutine
-    def start(self, name):
+    async def start(self, name):
         """
         Запустить стенд
         """
-        self._free_resources()
-        s = yield self._stand_with_validate(name)
-        with (yield s.lock.acquire()):
-            yield s.start()
+        await self._free_resources()
+        s = await self._stand_with_validate(name)
+        with (await s.lock):
+            await s.start()
         return 'Done'
 
-    @gen.coroutine
-    def backup_all(self):
+    async def backup_all(self):
         """
         Создать бэкап базы данных всех стендов
         """
         log.info('Backup all stands')
-        ss = yield self.stands()
-        for s in ss.values():
+        for s in (await self.stands()).values():
             assert isinstance(s, Stand)
             log.info('New task: backup, stand: %s', s.name)
-            with(yield s.lock.acquire()):
-                s.queue.put((s.backup, s.lock, 'backup {}'.format(s.name)))
+            with(await s.lock):
+                await s.queue.put((s.backup, s.lock, 'backup {}'.format(s.name)))
 
-    @gen.coroutine
-    def update_all(self):
+    async def update_all(self):
         """
         Обновить все стенды
         """
         log.info('Backup all stands')
-        ss = yield self.stands()
-        for s in ss.values():
+        for s in (await self.stands()).values():
             assert isinstance(s, Stand)
             log.info('New task: update, stand: %s', s.name)
             # возможно в этот момент для стенда создется очередь
-            with(yield s.lock.acquire()):
-                s.queue.put((s.update, s.lock, 'update {}'.format(s.name)))
+            with(await s.lock):
+                await s.queue.put((s.update, s.lock, 'update {}'.format(s.name)))
 
-    @gen.coroutine
-    def backup_and_update(self):
+    async def backup_and_update(self):
         """
         Создать бэкапы всех стендов и обновить. Если во время бэкапа произошла ошибка, то обновление не происходит
         """
         log.info('Backup and update all stands')
-        ss = yield self.stands()
-        for s in ss.values():
+        for s in (await self.stands()).values():
             assert isinstance(s, Stand)
 
             log.info('New task: backup and update, stand: %s', s.name)
-            with(yield s.lock.acquire()):
-                s.queue.put((s.backup_and_update, s.lock, 'backup_and_update {}'.format(s.name)))
+            with(await s.lock):
+                await s.queue.put((s.backup_and_update, s.lock, 'backup_and_update {}'.format(s.name)))

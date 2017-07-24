@@ -1,8 +1,8 @@
-FROM python:3.4
+FROM python:3.5
 
 RUN pip3 install --upgrade pip \
- docker-py==1.10 \
- tornado==4.5
+ docker-py \
+ tornado
 
 ENV TZ=Asia/Yekaterinburg
 

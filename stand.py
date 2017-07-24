@@ -1,16 +1,19 @@
+import asyncio
+import functools
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
 from docker import Client
-from tornado import gen, locks
 from tornado.httpclient import AsyncHTTPClient, HTTPError
+from tornado.platform.asyncio import to_asyncio_future
 
 log = logging.getLogger(__name__)
 
 
 class Stand(object):
-    TPE = ThreadPoolExecutor(max_workers=4)
+    @staticmethod
+    async def run_in_tpe(func, *args, **kwargs):
+        return await asyncio.get_event_loop().run_in_executor(None, functools.partial(func, *args, **kwargs))
 
     def __init__(self, name, test_tools_addr, stop_timeout):
         # параметр для управления контейнером
@@ -23,9 +26,9 @@ class Stand(object):
         # динамические параметры этого приложения
         self.queue = None
         self.docker = Client(base_url='unix:///var/run/docker.sock')
-        self.stop_future = None
+        self.stop_task = None
         self.stop_timeout = stop_timeout
-        self.lock = locks.Lock()
+        self.lock = asyncio.Lock()
 
         # обновляемые параметры
         self.db_addr = None
@@ -36,9 +39,8 @@ class Stand(object):
         self.active_task = None
         self.uni_version = None
 
-    @gen.coroutine
-    def refresh(self):
-        c_inspect = yield self.TPE.submit(self.docker.inspect_container, self.name)
+    async def refresh(self):
+        c_inspect = await self.run_in_tpe(self.docker.inspect_container, self.name)
         self.running = c_inspect['State']['Running']
         if self.running:
             try:
@@ -47,7 +49,7 @@ class Stand(object):
             except (KeyError, IndexError, TypeError):
                 logging.warning('Found container name=%s with unbind ports. Cannot use it', self.name)
                 return
-            response = yield self._test_tool_action('engine_status', 10)
+            response = await self._test_tool_action('engine_status', 10)
             engine_status = json.loads(response.body.decode('utf8'))
             self.db_addr = engine_status['db_addr']
             self.tomcat_returncode = engine_status['tomcat_returncode']
@@ -62,8 +64,7 @@ class Stand(object):
             self.active_task = '-'
             self.uni_version = '-'
 
-    @gen.coroutine
-    def _test_tool_action(self, action_name, timeout):
+    async def _test_tool_action(self, action_name, timeout):
         http_request = 'http://{}:{}/{}?sync=1'.format(self.test_tools_addr, self.test_tools_port, action_name)
         log.debug('Request %s timeout=%s', http_request, timeout)
         cl = AsyncHTTPClient()
@@ -71,7 +72,7 @@ class Stand(object):
         try_count = 0
         while try_count < 15:
             try:
-                response = yield cl.fetch(http_request, request_timeout=timeout)
+                response = await to_asyncio_future(cl.fetch(http_request, request_timeout=timeout))
                 # если порт уже прослушивается но сервер не готов отвечать на запросы то вернется пустой ответ
                 if response:
                     return response
@@ -81,43 +82,39 @@ class Stand(object):
             except HTTPError as e:
                 if not e.code == 599:
                     raise e
-            yield gen.sleep(1)
+            await asyncio.sleep(1)
             try_count += 1
         # Если подключиться не удалось то возоможно кто-то остановил контейнер, но что поделать, значит нельзя
         # закончить текущую операцию
-        self.running = yield self.TPE.submit(self.docker.inspect_container, self.name)['State']['Running']
+        self.running = (await self.run_in_tpe(self.docker.inspect_container, self.name))['State']['Running']
         if not self.running:
             raise RuntimeError('Container %s has stopped unexpectedly' % self.name)
         else:
             raise TimeoutError('Container %s test tools is not available' % self.name)
 
-    @gen.coroutine
-    def backup(self):
+    async def backup(self):
         log.info('Backup %s started', self.name)
-        yield self.start()
-        yield self.refresh()
+        await self.start()
+        await self.refresh()
         # ждем запуска uni чтобы не забэкапить сломанный стенд
-        yield self._test_tool_action('check_uni', 1000)
-        yield self._test_tool_action('backup', 10800)
-        yield self.stop()
+        await self._test_tool_action('check_uni', 1000)
+        await self._test_tool_action('backup', 10800)
+        await self.stop()
         log.info('Backup %s completed', self.name)
 
-    @gen.coroutine
-    def update(self):
+    async def update(self):
         log.info('Update %s started', self.name)
-        yield self.start()
-        yield self._test_tool_action('build_and_update', 1800)
-        yield self._test_tool_action('check_uni', 1000)
-        yield self.stop()
+        await self.start()
+        await self._test_tool_action('build_and_update', 1800)
+        await self._test_tool_action('check_uni', 1000)
+        await self.stop()
         log.info('Update %s completed', self.name)
 
-    @gen.coroutine
-    def backup_and_update(self):
-        yield self.backup()
-        yield self.update()
+    async def backup_and_update(self):
+        await self.backup()
+        await self.update()
 
-    @gen.coroutine
-    def log(self, tail=150):
+    async def log(self, tail=150):
         """
         Получить логи стенда
         :param tail: колличество строк с конца
@@ -129,35 +126,35 @@ class Stand(object):
                 tail = int(tail)
             except ValueError:
                 tail = 150
-        log_str = yield self.TPE.submit(self.docker.logs, self.name, tail=tail)
+        log_str = await self.run_in_tpe(self.docker.logs, self.name, tail=tail)
         return log_str
 
-    @gen.coroutine
-    def stop_by_timeout(self, future):
-        # Tornado ``Futures`` do not support cancellation at current version
-        # if name in sm.stands_futures:
-        #     sm.stands_futures[name].cancel()
-        # Торнадовская футура передаст self в callback
-        if future is self.stop_future:
+    async def stop_by_timeout(self):
+        try:
+            await asyncio.sleep(30)
             log.info('Stop by timeout %s', self.name)
-            with (yield self.lock.acquire()):
-                yield self.stop()
+            with (await self.lock):
+                await self._test_tool_action('stop_tomcat', 60)
+        except asyncio.CancelledError:
+            return
 
-    @gen.coroutine
-    def start(self):
+    async def start(self):
         log.info('Start stand %s', self.name)
+
         # Выключение стенда по таймауту
-        if self.stop_timeout:
-            future = gen.sleep(self.stop_timeout * 60)
-            future.add_done_callback(self.stop_by_timeout)
-            self.stop_future = future
+        if self.stop_task:
+            self.stop_task.cancel()
 
-        yield self.TPE.submit(self.docker.start, self.name)
-        yield self.refresh()
-        yield self._test_tool_action('start_tomcat', 30)
+        with (await self.lock):
+            if self.stop_timeout:
+                self.stop_task = asyncio.get_event_loop().create_task(self.stop_by_timeout())
+            await self.run_in_tpe(self.docker.start, self.name)
+            await self.refresh()
+            await self._test_tool_action('start_tomcat', 30)
 
-    @gen.coroutine
-    def stop(self):
+    async def stop(self):
         log.info('Stop stand %s', self.name)
-        self.stop_future = None
-        yield self._test_tool_action('stop_tomcat', 60)
+        with (await self.lock):
+            if self.stop_task:
+                self.stop_task.cancel()
+            await self._test_tool_action('stop_tomcat', 60)

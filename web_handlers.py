@@ -1,7 +1,6 @@
 import logging
 import os
 
-from tornado import gen
 from tornado.web import RequestHandler
 
 from stand import Stand
@@ -16,18 +15,14 @@ class MainPageHandler(RequestHandler):
     with open(os.path.join(os.path.dirname(__file__), 'html', 'stand.html')) as f:
         CONTENT_TEMPLATE = f.read()
 
-    @gen.coroutine
-    def get(self):
+    async def get(self):
         content = ''
         engine = self.application.engine
 
-        ss = yield engine.refresh_all()
-        names = list(ss.keys())
-        names.sort()
+        ss = await engine.refresh_all()
 
-        for name in names:
+        for name in sorted(ss):
             s = ss[name]
-            # ss.values() возвращает не в алфавитном порядке
             assert isinstance(s, Stand)
             # 143 application was terminated due to a SIGTERM command (стандартная остановка процесса)
             # 137 Script terminated by kill signal (например неожиданно убит докер полным выключением питания)
@@ -53,6 +48,7 @@ class MainPageHandler(RequestHandler):
                                                     test_tools_port=s.test_tools_port,
                                                     uni_version=s.uni_version,
                                                     uni_port=s.uni_port)
+
         self.finish(self.PAGE_TEMPLATE.format(content=content or 'Стенды не найдены'))
 
 
@@ -60,8 +56,7 @@ class MassActionHandler(RequestHandler):
     ACTIONS = ('update_all', 'backup_all', 'backup_and_update')
     QUEUES_STATUS = 'queues_status'
 
-    @gen.coroutine
-    def get(self, action):
+    async def get(self, action):
         engine = self.application.engine
         if action in self.ACTIONS:
             for q in engine.queues.values():
@@ -69,7 +64,7 @@ class MassActionHandler(RequestHandler):
                     self.finish('Busy with another mass task')
                     return
 
-            output = yield getattr(engine, action)()
+            output = await getattr(engine, action)()
             self.finish(output)
             return
 
@@ -88,18 +83,17 @@ class ContainerActions(RequestHandler):
     with open(os.path.join(os.path.dirname(__file__), 'html', 'log.html')) as f:
         LOG_TEMPLATE = f.read()
 
-    @gen.coroutine
-    def get(self, name, action):
+    async def get(self, name, action):
         engine = self.application.engine
         try:
             if action == self.LOG:
                 tail = self.get_argument('tail', '150')
-                output = yield engine.log(name=name, tail=tail)
+                output = await engine.log(name=name, tail=tail)
                 self.finish(self.LOG_TEMPLATE.format(content=output.decode()))
                 return
 
             if action in self.ACTIONS:
-                output = yield getattr(engine, action)(name=name)
+                output = await getattr(engine, action)(name=name)
                 self.finish(output)
                 return
 

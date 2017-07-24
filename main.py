@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
+import asyncio
 import logging
 import logging.config
 import os
 
-from tornado.ioloop import IOLoop
+from tornado.platform.asyncio import AsyncIOMainLoop
 from tornado.web import Application
 
 import web_handlers
@@ -60,10 +61,11 @@ def main():
                            'Usually ip of eth0 is correct')
 
     logging.config.dictConfig(default_logging(params.pop('log_level')))
-    application.engine = Engine(**params)
 
+    AsyncIOMainLoop().install()
+    application.engine = Engine(**params)
     application.listen(8888)
-    IOLoop.instance().start()
+    asyncio.get_event_loop().run_forever()
 
 
 if __name__ == '__main__':
